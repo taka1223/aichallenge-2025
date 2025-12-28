@@ -7,3 +7,6 @@ rosbag2*/
 *.pyc
 *pem
 vehicle/.env
+.venv/
+__pycache__/
+*.pyc
