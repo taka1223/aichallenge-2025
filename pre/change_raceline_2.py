@@ -3,30 +3,38 @@ import numpy as np
 import matplotlib.pyplot as plt
 import xml.etree.ElementTree as ET
 from pathlib import Path
+import matplotlib as mpl
+mpl.rcParams["keymap.save"] = []  
 
 # ========= パス =========
-csv_path = Path("/home/ishikawa/workspace/aichallenge-2025/aichallenge/workspace/src/aichallenge_submit/simple_trajectory_generator/data/raceline_awsim_30km_from_garage_2.csv")
+csv_path = Path("/home/ishikawa/workspace/aichallenge-2025/aichallenge/workspace/src/aichallenge_submit/simple_trajectory_generator/data/raceline_awsim_30km_from_garage_2_manual_edit.csv")
 osm_path = Path("/home/ishikawa/workspace/aichallenge-2025/aichallenge/workspace/src/aichallenge_submit/aichallenge_submit_launch/map/lanelet2_map.osm")
 
 assert csv_path.exists(), f"CSV not found: {csv_path}"
 assert osm_path.exists(), f"OSM not found: {osm_path}"
 
-# ========= 調整パラメータ =========
-i_center = 60            # ←壁が近い場所（あなたの例）
-half_win = 15            # 影響範囲（±） ※12→15推奨
-offset_m = 1.5           # ★追加：アウト側へ逃がす量[m]（0.6→0.9推奨）
-zoom_margin = 12.0       # 描画の余白
-wall_bbox_margin = 30.0  # 壁候補を絞るbbox余白（m）
-# ==================================
+# ========= 調整 =========
+zoom_margin = 12.0
+wall_bbox_margin = 30.0
+
+# 「点を掴める半径」[m]（大きいほど掴みやすい）
+pick_radius_m = 1.5
+
+# 壁距離の目標（表示用）
+d_target = 2.2
 
 # ========= Raceline読み込み =========
 df = pl.read_csv(csv_path).with_row_index("idx")
 x = df["x"].to_numpy()
 y = df["y"].to_numpy()
-
 n = len(x)
-i0 = max(1, i_center - half_win)
-i1 = min(n - 2, i_center + half_win)
+
+x_mod = x.copy()
+y_mod = y.copy()
+
+print(f"Loaded raceline points: n={n}")
+print("x range:", x.min(), "->", x.max())
+print("y range:", y.min(), "->", y.max())
 
 # ========= Lanelet2 OSM読み込み =========
 tree = ET.parse(osm_path)
@@ -71,7 +79,6 @@ def is_wall_candidate(tags: dict) -> bool:
         return True
     return False
 
-# wayを座標列として保持
 all_ways = []
 wall_ways = []
 
@@ -90,7 +97,7 @@ for way in root.findall(".//{*}way"):
 
 print(f"OSM ways: total={len(all_ways)}, wall_candidates={len(wall_ways)}")
 
-# ========= 壁候補をraceline近傍だけに絞る =========
+# ========= 近傍だけ表示（高速化） =========
 xmin, xmax = x.min(), x.max()
 ymin, ymax = y.min(), y.max()
 bbox = (xmin - wall_bbox_margin, xmax + wall_bbox_margin, ymin - wall_bbox_margin, ymax + wall_bbox_margin)
@@ -103,7 +110,7 @@ wall_ways_near = [(xs, ys, tags) for (xs, ys, tags) in wall_ways if intersects_b
 all_ways_near  = [(xs, ys, tags) for (xs, ys, tags) in all_ways  if intersects_bbox(xs, ys, bbox)]
 print(f"Near bbox: all={len(all_ways_near)}, wall_candidates={len(wall_ways_near)}")
 
-# ========= 距離計算：点→線分群 =========
+# ========= 距離計算用：線分配列 =========
 def point_to_segments_min_dist(px, py, seg_x1, seg_y1, seg_x2, seg_y2):
     vx = seg_x2 - seg_x1
     vy = seg_y2 - seg_y1
@@ -133,118 +140,139 @@ def build_segments(ways_list):
     seg_y2 = np.concatenate([s[3] for s in segs])
     return seg_x1, seg_y1, seg_x2, seg_y2
 
+# 距離の対象はまず壁候補。なければ全ways
 target_ways = wall_ways_near if len(wall_ways_near) > 0 else all_ways_near
 segments = build_segments(target_ways)
 assert segments is not None, "No segments found. OSM parsing/coordinate system might be wrong."
-
 seg_x1, seg_y1, seg_x2, seg_y2 = segments
 
-def min_dist_for_range(xx, yy, a0, a1):
-    d = []
-    for i in range(a0, a1 + 1):
-        d.append(point_to_segments_min_dist(xx[i], yy[i], seg_x1, seg_y1, seg_x2, seg_y2).min())
-    d = np.array(d)
-    imin_local = int(np.argmin(d))
-    imin = a0 + imin_local
-    return d, imin, d[imin_local]
+def wall_dist(px, py):
+    return point_to_segments_min_dist(px, py, seg_x1, seg_y1, seg_x2, seg_y2).min()
 
-# ========= まず修正前の距離 =========
-d_before, imin_b, dmin_b = min_dist_for_range(x, y, i0, i1)
-print(f"\n[BEFORE] nearest within [{i0}, {i1}]: idx={imin_b}, dist={dmin_b:.3f} m")
+# ========= 便利：最近傍 idx =========
+def nearest_idx(px, py, xx, yy):
+    d2 = (xx - px)**2 + (yy - py)**2
+    return int(np.argmin(d2))
 
-# ========= ★局所オフセット（アウト側へ） =========
-def smooth_weight(t):
-    # 0..1..0 のなだらか重み
-    return 0.5 - 0.5*np.cos(2*np.pi*t)
-
-x_mod = x.copy()
-y_mod = y.copy()
-
-# 「向き判定用」の微小ステップ（大きすぎると判定が不安定）
-probe = 0.10  # m
-
-for i in range(i0, i1 + 1):
-    # 接線（前後差分）
-    tx = x[i+1] - x[i-1]
-    ty = y[i+1] - y[i-1]
-    tnorm = np.hypot(tx, ty)
-    if tnorm == 0:
-        continue
-    tx /= tnorm
-    ty /= tnorm
-
-    # 左法線（左に90度）
-    nxL, nyL = -ty, tx
-    # 右法線
-    nxR, nyR = -nxL, -nyL
-
-    # 現在の壁距離
-    d0 = point_to_segments_min_dist(x[i], y[i], seg_x1, seg_y1, seg_x2, seg_y2).min()
-
-    # 左へ probe 動かした場合の壁距離
-    dL = point_to_segments_min_dist(x[i] + nxL*probe, y[i] + nyL*probe,
-                                    seg_x1, seg_y1, seg_x2, seg_y2).min()
-
-    # 右へ probe 動かした場合の壁距離
-    dR = point_to_segments_min_dist(x[i] + nxR*probe, y[i] + nyR*probe,
-                                    seg_x1, seg_y1, seg_x2, seg_y2).min()
-
-    # 壁からより離れる方向を採用
-    if dL >= dR:
-        nx_away, ny_away = nxL, nyL
-    else:
-        nx_away, ny_away = nxR, nyR
-
-    # 重み（中心で最大）
-    t = (i - i0) / (i1 - i0 + 1e-9)
-    w = smooth_weight(t)
-
-    x_mod[i] += nx_away * offset_m * w
-    y_mod[i] += ny_away * offset_m * w
-
-# ========= 修正後の距離 =========
-d_after, imin_a, dmin_a = min_dist_for_range(x_mod, y_mod, i0, i1)
-print(f"[AFTER ] nearest within [{i0}, {i1}]: idx={imin_a}, dist={dmin_a:.3f} m")
-print(f"Suggested goal: >= 2.2 m (now: {dmin_a:.3f} m)")
-
-# ========= 保存 =========
-df_out = df.with_columns([
-    pl.Series("x", x_mod),
-    pl.Series("y", y_mod),
-])
-out_path = csv_path.with_name(csv_path.stem + f"_safe_i{i_center}_off{offset_m:.2f}.csv")
-df_out.drop("idx").write_csv(out_path)  # idx列は不要なら落とす
-print("Saved:", out_path)
-
-# ========= 描画（壁＋修正前後raceline＋危険点） =========
+# ========= 描画 =========
 fig, ax = plt.subplots(figsize=(10, 10))
 
 for xs, ys, _ in all_ways_near:
     ax.plot(xs, ys, linewidth=0.4, alpha=0.35)
-
 for xs, ys, _ in wall_ways_near:
     ax.plot(xs, ys, linewidth=1.0, alpha=0.75)
 
-# before/after
-ax.plot(x, y, "--", linewidth=2.0, alpha=0.6, label="raceline BEFORE")
-ax.plot(x_mod, y_mod, "-", linewidth=2.5, label="raceline AFTER")
+# BEFORE
+ax.plot(x, y, "--", linewidth=2.0, alpha=0.5, label="raceline BEFORE")
 
-# 編集範囲を強調
-ax.scatter(x[i0:i1+1], y[i0:i1+1], s=18, alpha=0.25, label="edited range (before)")
-ax.scatter(x_mod[i0:i1+1], y_mod[i0:i1+1], s=18, alpha=0.25, label="edited range (after)")
+# AFTER (編集対象)
+line_after, = ax.plot(x_mod, y_mod, "-", linewidth=2.5, label="raceline AFTER (editable)")
 
-# 最短点マーキング
-ax.scatter([x[imin_b]], [y[imin_b]], s=140, marker="x", label=f"min BEFORE idx={imin_b}, d={dmin_b:.2f}m")
-ax.scatter([x_mod[imin_a]], [y_mod[imin_a]], s=140, marker="x", label=f"min AFTER idx={imin_a}, d={dmin_a:.2f}m")
+# 選択点の表示（赤い丸）
+sel_scatter = ax.scatter([], [], s=220, marker="o", facecolors="none", edgecolors="red", linewidths=2, zorder=20)
+sel_text = ax.text(0, 0, "", color="red", fontsize=11, weight="bold", zorder=21)
 
 # zoom
-margin = zoom_margin
-ax.set_xlim(xmin - margin, xmax + margin)
-ax.set_ylim(ymin - margin, ymax + margin)
+ax.set_xlim(xmin - zoom_margin, xmax + zoom_margin)
+ax.set_ylim(ymin - zoom_margin, ymax + zoom_margin)
 ax.set_aspect("equal", adjustable="box")
 ax.set_autoscale_on(False)
 ax.grid(True)
-ax.set_title("Raceline + Lanelet2 (walls) + distance check + local offset")
+ax.set_title("LeftClick: info. Drag: move point. Press 'w' to save CSV. Press 'r' to reset.")
 ax.legend(loc="best")
 fig.tight_layout()
+
+# ========= インタラクション状態 =========
+drag = {"active": False, "idx": None}
+
+def update_selection(i):
+    d = wall_dist(x_mod[i], y_mod[i])
+    sel_scatter.set_offsets([[x_mod[i], y_mod[i]]])
+    sel_text.set_position((x_mod[i], y_mod[i]))
+    sel_text.set_text(f"  idx={i}\n  d={d:.2f} m\n  target={d_target:.1f} m")
+    fig.canvas.draw_idle()
+    print(f"[SELECT] idx={i} x={x_mod[i]:.3f} y={y_mod[i]:.3f} wall_dist={d:.3f} m")
+
+def on_press(event):
+    if event.xdata is None or event.ydata is None:
+        return
+    i = nearest_idx(event.xdata, event.ydata, x_mod, y_mod)
+    dist = np.hypot(x_mod[i] - event.xdata, y_mod[i] - event.ydata)
+    if dist > pick_radius_m:
+        return
+    drag["active"] = True
+    drag["idx"] = i
+    update_selection(i)
+
+def on_motion(event):
+    if not drag["active"]:
+        return
+    if event.xdata is None or event.ydata is None:
+        return
+    i = drag["idx"]
+    x_mod[i] = event.xdata
+    y_mod[i] = event.ydata
+    line_after.set_data(x_mod, y_mod)
+    update_selection(i)
+
+def on_release(event):
+    if not drag["active"]:
+        return
+    i = drag["idx"]
+    drag["active"] = False
+    drag["idx"] = None
+    # 最終位置を表示
+    d = wall_dist(x_mod[i], y_mod[i])
+    print(f"[DRAG END] idx={i} x={x_mod[i]:.3f} y={y_mod[i]:.3f} wall_dist={d:.3f} m")
+
+def on_click(event):
+    # クリック（ドラッグ開始もこれを通るので、activeのときは無視）
+    if drag["active"]:
+        return
+    if event.xdata is None or event.ydata is None:
+        return
+    i = nearest_idx(event.xdata, event.ydata, x_mod, y_mod)
+    update_selection(i)
+
+def on_key(event):
+    k = (event.key or "").lower()
+
+    # 'w' でCSV保存（sはmatplotlibに取られがち）
+    if k == "w":
+        out_path = csv_path.with_name(csv_path.stem + "_manual_edit.csv")
+        df_out = df.select([c for c in df.columns if c != "idx"]).with_columns([
+            pl.Series(name="x", values=x_mod.tolist()),
+            pl.Series(name="y", values=y_mod.tolist()),
+        ])
+        df_out.write_csv(out_path)
+        print(f"[CSV SAVE OK] {out_path}")
+
+    elif k == "r":
+        x_mod[:] = x
+        y_mod[:] = y
+        line_after.set_data(x_mod, y_mod)
+        sel_scatter.set_offsets(np.empty((0, 2)))
+        sel_text.set_text("")
+        fig.canvas.draw_idle()
+        print("[RESET] back to original (BEFORE)")
+
+
+fig.canvas.mpl_connect("button_press_event", on_press)
+fig.canvas.mpl_connect("motion_notify_event", on_motion)
+fig.canvas.mpl_connect("button_release_event", on_release)
+fig.canvas.mpl_connect("button_press_event", on_click)
+fig.canvas.mpl_connect("key_press_event", on_key)
+
+
+# ========= 保存（確実版） =========
+out_path = csv_path.with_name(csv_path.stem + "_manual_edit.csv")
+
+df_out = df.select([c for c in df.columns if c != "idx"]).with_columns([
+    pl.Series(name="x", values=x_mod.tolist()),
+    pl.Series(name="y", values=y_mod.tolist()),
+])
+
+df_out.write_csv(out_path)
+print(f"[SAVE OK] {out_path}")
+
 plt.show()
